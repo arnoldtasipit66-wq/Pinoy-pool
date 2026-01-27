@@ -27,10 +27,11 @@ const db = admin.firestore();
 
 // --- 2. HEALTH CHECK ---
 app.get('/', (req, res) => {
-  res.send('Pinoy Pool Server is LIVE! 🎱');
+  res.send('Pinoy Pool Server is LIVE! 🎱 - Secured Version');
 });
 
-// --- 3. API: RECORD WIN ---
+// --- 3. API: RECORD BALL (REWARDS) ---
+// Ginagamit habang tumatakbo ang laro para sa bawat bolang mahuhulog
 app.post('/api/record-win', async (req, res) => {
   const { uid, ballsPocketed, gameMode } = req.body;
   if (!uid) return res.status(400).json({ error: "Missing UID" });
@@ -59,7 +60,7 @@ app.post('/api/record-win', async (req, res) => {
   }
 });
 
-// --- 4. API: DEDUCT BALANCE ---
+// --- 4. API: DEDUCT BALANCE (BETTING) ---
 app.post('/api/deduct-balance', async (req, res) => {
   const { uid, amount } = req.body;
   if (!uid || !amount) return res.status(400).json({ error: "Invalid data" });
@@ -81,12 +82,12 @@ app.post('/api/deduct-balance', async (req, res) => {
   }
 });
 
-// --- 5. API: MATCH PAYOUT ---
+// --- 5. API: MATCH PAYOUT (POT WINNINGS) ---
 app.post('/api/match-payout', async (req, res) => {
   const { uid, betAmount } = req.body;
   if (!uid) return res.json({ success: true });
 
-  const WINNINGS = (betAmount || 0) * 1.8; // Simple 10% cut logic
+  const WINNINGS = (betAmount || 0) * 1.8; // 10% House Cut per player
 
   try {
     const playerRef = db.collection('players').doc(uid);
@@ -100,14 +101,13 @@ app.post('/api/match-payout', async (req, res) => {
   }
 });
 
-// --- 6. API: REFUND (CORRECTED) ---
+// --- 6. API: REFUND ---
 app.post('/api/refund', async (req, res) => {
   const { uid, amount } = req.body;
   if (!uid || !amount) return res.status(400).json({ error: "Missing data" });
 
   try {
     const playerRef = db.collection('players').doc(uid);
-    // ETO ANG AYOS NA CODE:
     await playerRef.update({
         balance: admin.firestore.FieldValue.increment(amount)
     });
@@ -133,7 +133,59 @@ app.post('/api/ad-reward', async (req, res) => {
   }
 });
 
-// --- HYBRID START (Magic Part) ---
+// --- 8. NEW SECURED API: VALIDATE WIN (STATS & TROPHIES) ---
+// Haharangan nito ang mga cheater na gumagamit ng console para mandaya ng wins/rank.
+app.post('/api/validate-win', async (req, res) => {
+  const { uid, gameId } = req.body;
+  if (!uid || !gameId) return res.status(400).json({ error: "Missing required data" });
+
+  try {
+    // 1. Hanapin ang game record sa Firestore
+    const gameRef = db.collection('games').doc(gameId);
+    const gameDoc = await gameRef.get();
+
+    if (!gameDoc.exists) return res.status(404).json({ error: "Match ID invalid" });
+    
+    const gameData = gameDoc.data();
+
+    // 2. SECURITY CHECK: Dapat "finished" na ang laro sa database.
+    // Kapag tinawag ito habang tumatakbo pa ang game, hindi ito papayagan ng server.
+    if (gameData.gameState !== 'finished') {
+      return res.status(400).json({ error: "Validation failed: Match is still active in database" });
+    }
+
+    // 3. Kilalanin kung sino talaga ang panalo base sa Database record
+    const isWinner = gameData.winner === uid;
+    
+    // 4. Server-Side Stat Calculation (Hindi mababago ng player)
+    const trophiesChange = isWinner ? 25 : -20;
+    const xpGain = isWinner ? 50 : 15;
+
+    const playerRef = db.collection('players').doc(uid);
+    
+    // 5. I-update ang Stats gamit ang Atomic Increment (Safe sa spam)
+    await playerRef.set({
+      trophies: admin.firestore.FieldValue.increment(trophiesChange),
+      xp: admin.firestore.FieldValue.increment(xpGain),
+      wins: admin.firestore.FieldValue.increment(isWinner ? 1 : 0),
+      lastPlayed: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    res.json({ 
+      success: true, 
+      isWinner, 
+      trophiesChange, 
+      xpGain,
+      message: isWinner ? "Panalo validated!" : "Talo recorded." 
+    });
+
+  } catch (error) {
+    console.error("Critical Validation Error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- HYBRID START ---
 if (require.main === module) {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => {
