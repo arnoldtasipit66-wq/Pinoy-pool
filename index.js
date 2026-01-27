@@ -2,6 +2,7 @@ const express = require('express');
 const admin = require('firebase-admin');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const crypto = require('crypto'); // Import para sa security validation
 
 const app = express();
 app.use(cors());
@@ -9,7 +10,7 @@ app.use(bodyParser.json());
 
 // --- 1. FIREBASE SETUP ---
 if (!process.env.FIREBASE_KEY) {
-  console.log("Warning: FIREBASE_KEY not found (OK for local test).");
+  console.log("Warning: FIREBASE_KEY not found.");
 } else {
   try {
     const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
@@ -25,163 +26,149 @@ if (!process.env.FIREBASE_KEY) {
 
 const db = admin.firestore();
 
-// --- 2. HEALTH CHECK ---
+// --- 2. SECURITY HELPER: TELEGRAM VALIDATION ---
+// Tinitiyak nito na ang request ay galing talaga sa Telegram app mo.
+function verifyTelegramData(initData) {
+  if (!initData || !process.env.TELEGRAM_BOT_TOKEN) return false;
+
+  const params = new URLSearchParams(initData);
+  const hash = params.get('hash');
+  params.delete('hash');
+
+  const dataCheckString = Array.from(params.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, value]) => `${key}=${value}`)
+    .join('\n');
+
+  const secretKey = crypto.createHmac('sha256', 'WebAppData')
+    .update(process.env.TELEGRAM_BOT_TOKEN)
+    .digest();
+  const calculatedHash = crypto.createHmac('sha256', secretKey)
+    .update(dataCheckString)
+    .digest('hex');
+
+  return calculatedHash === hash;
+}
+
+// --- 3. API: HEALTH CHECK ---
 app.get('/', (req, res) => {
   res.send('Pinoy Pool Server is LIVE! 🎱 - Secured Version');
 });
 
-// --- 3. API: RECORD BALL (REWARDS) ---
-// Ginagamit habang tumatakbo ang laro para sa bawat bolang mahuhulog
-app.post('/api/record-win', async (req, res) => {
-  const { uid, ballsPocketed, gameMode } = req.body;
-  if (!uid) return res.status(400).json({ error: "Missing UID" });
+// --- 4. API: AD REWARD (SECURED) ---
+app.post('/api/ad-reward', async (req, res) => {
+  const { uid, initData } = req.body;
 
-  let REWARD_PER_BALL = 10;
-  let XP_PER_BALL = 10;
-
-  if (gameMode && (gameMode.includes('ai') || gameMode.includes('practice'))) {
-      REWARD_PER_BALL = 2;
-      XP_PER_BALL = 2;
+  // Security Check: Galing ba sa Telegram?
+  if (!verifyTelegramData(initData)) {
+    return res.status(401).json({ error: "Unauthorized access" });
   }
 
-  const totalReward = (ballsPocketed || 0) * REWARD_PER_BALL;
-  const totalXP = (ballsPocketed || 0) * XP_PER_BALL;
+  const FIXED_AD_REWARD = 50; // Dito mo i-set ang reward, hindi sa client!
 
   try {
     const playerRef = db.collection('players').doc(uid);
-    await playerRef.set({
-      balance: admin.firestore.FieldValue.increment(totalReward),
-      xp: admin.firestore.FieldValue.increment(totalXP),
-      lastPlayedTime: admin.firestore.FieldValue.serverTimestamp()
-    }, { merge: true });
-    res.json({ success: true });
+    await playerRef.update({
+      balance: admin.firestore.FieldValue.increment(FIXED_AD_REWARD)
+    });
+    const updatedDoc = await playerRef.get();
+    res.json({ success: true, newBalance: updatedDoc.data().balance });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: "Reward failed" });
   }
 });
 
-// --- 4. API: DEDUCT BALANCE (BETTING) ---
-app.post('/api/deduct-balance', async (req, res) => {
-  const { uid, amount } = req.body;
-  if (!uid || !amount) return res.status(400).json({ error: "Invalid data" });
+// --- 5. API: START MATCH (NEW SECURITY LAYER) ---
+// Tatawagin ito sa simula ng laro para magkaroon ng "Match Record"
+app.post('/api/start-match', async (req, res) => {
+  const { uid, betAmount, initData } = req.body;
+
+  if (!verifyTelegramData(initData)) return res.status(401).json({ error: "Unauthorized" });
+
+  const matchId = `match_${Date.now()}_${uid}`;
 
   try {
     const playerRef = db.collection('players').doc(uid);
+    
     await db.runTransaction(async (t) => {
       const doc = await t.get(playerRef);
       if (!doc.exists) throw "User not found";
+      
       const currentBalance = doc.data().balance || 0;
-      if (currentBalance < amount) throw "Insufficient funds";
-      t.update(playerRef, { balance: currentBalance - amount });
+      if (currentBalance < betAmount) throw "Insufficient funds";
+
+      // Bawasan ang pera at i-record ang match
+      t.update(playerRef, { balance: currentBalance - betAmount });
+      t.set(db.collection('matches').doc(matchId), {
+        uid,
+        bet: betAmount,
+        status: 'active',
+        startTime: admin.firestore.FieldValue.serverTimestamp()
+      });
     });
-    const updatedDoc = await playerRef.get();
-    res.json({ success: true, newBalance: updatedDoc.data().balance });
+
+    res.json({ success: true, matchId });
   } catch (error) {
-    const msg = (error === "Insufficient funds") ? "Not enough balance" : "Transaction Failed";
-    res.status(400).json({ success: false, message: msg });
+    res.status(400).json({ error: error.toString() });
   }
 });
 
-// --- 5. API: MATCH PAYOUT (POT WINNINGS) ---
-app.post('/api/match-payout', async (req, res) => {
-  const { uid, betAmount } = req.body;
-  if (!uid) return res.json({ success: true });
+// --- 6. API: VALIDATE WIN & PAYOUT (SECURED) ---
+app.post('/api/validate-win', async (req, res) => {
+  const { uid, matchId, initData } = req.body;
 
-  const WINNINGS = (betAmount || 0) * 1.8; // 10% House Cut per player
+  if (!verifyTelegramData(initData)) return res.status(401).json({ error: "Unauthorized" });
 
   try {
+    const matchRef = db.collection('matches').doc(matchId);
     const playerRef = db.collection('players').doc(uid);
-    await playerRef.update({
-        balance: admin.firestore.FieldValue.increment(WINNINGS)
+
+    const result = await db.runTransaction(async (t) => {
+      const matchDoc = await t.get(matchRef);
+      
+      if (!matchDoc.exists || matchDoc.data().status !== 'active') {
+        throw "Invalid or expired match";
+      }
+
+      const matchData = matchDoc.data();
+      const WINNINGS = matchData.bet * 1.8; // 10% House Cut per player
+      const TROPHIES = 25;
+      const XP = 50;
+
+      // I-update ang player
+      t.update(playerRef, {
+        balance: admin.firestore.FieldValue.increment(WINNINGS),
+        trophies: admin.firestore.FieldValue.increment(TROPHIES),
+        xp: admin.firestore.FieldValue.increment(XP),
+        wins: admin.firestore.FieldValue.increment(1)
+      });
+
+      // Tapusin na ang match record para hindi na ma-claim ulit
+      t.update(matchRef, { status: 'completed', payout: WINNINGS });
+
+      return { winnings: WINNINGS, trophies: TROPHIES, xp: XP };
     });
-    const updatedDoc = await playerRef.get();
-    res.json({ success: true, newBalance: updatedDoc.data().balance });
+
+    res.json({ success: true, data: result });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(400).json({ error: error.toString() });
   }
 });
 
-// --- 6. API: REFUND ---
+// --- 7. API: REFUND (SECURED) ---
 app.post('/api/refund', async (req, res) => {
-  const { uid, amount } = req.body;
-  if (!uid || !amount) return res.status(400).json({ error: "Missing data" });
+  const { uid, amount, initData } = req.body;
+  
+  if (!verifyTelegramData(initData)) return res.status(401).json({ error: "Unauthorized" });
 
   try {
     const playerRef = db.collection('players').doc(uid);
     await playerRef.update({
-        balance: admin.firestore.FieldValue.increment(amount)
+      balance: admin.firestore.FieldValue.increment(amount)
     });
     res.json({ success: true });
   } catch (error) {
-    console.error("Refund Error:", error);
     res.status(500).json({ error: "Refund failed" });
-  }
-});
-
-// --- 7. API: AD REWARD ---
-app.post('/api/ad-reward', async (req, res) => {
-  const { uid, amount } = req.body;
-  try {
-    const playerRef = db.collection('players').doc(uid);
-    await playerRef.update({
-        balance: admin.firestore.FieldValue.increment(amount)
-    });
-    const updatedDoc = await playerRef.get();
-    res.json({ success: true, newBalance: updatedDoc.data().balance });
-  } catch (error) {
-    res.status(500).json({ error: "Server Error" });
-  }
-});
-
-// --- 8. NEW SECURED API: VALIDATE WIN (STATS & TROPHIES) ---
-// Haharangan nito ang mga cheater na gumagamit ng console para mandaya ng wins/rank.
-app.post('/api/validate-win', async (req, res) => {
-  const { uid, gameId } = req.body;
-  if (!uid || !gameId) return res.status(400).json({ error: "Missing required data" });
-
-  try {
-    // 1. Hanapin ang game record sa Firestore
-    const gameRef = db.collection('games').doc(gameId);
-    const gameDoc = await gameRef.get();
-
-    if (!gameDoc.exists) return res.status(404).json({ error: "Match ID invalid" });
-    
-    const gameData = gameDoc.data();
-
-    // 2. SECURITY CHECK: Dapat "finished" na ang laro sa database.
-    // Kapag tinawag ito habang tumatakbo pa ang game, hindi ito papayagan ng server.
-    if (gameData.gameState !== 'finished') {
-      return res.status(400).json({ error: "Validation failed: Match is still active in database" });
-    }
-
-    // 3. Kilalanin kung sino talaga ang panalo base sa Database record
-    const isWinner = gameData.winner === uid;
-    
-    // 4. Server-Side Stat Calculation (Hindi mababago ng player)
-    const trophiesChange = isWinner ? 25 : -20;
-    const xpGain = isWinner ? 50 : 15;
-
-    const playerRef = db.collection('players').doc(uid);
-    
-    // 5. I-update ang Stats gamit ang Atomic Increment (Safe sa spam)
-    await playerRef.set({
-      trophies: admin.firestore.FieldValue.increment(trophiesChange),
-      xp: admin.firestore.FieldValue.increment(xpGain),
-      wins: admin.firestore.FieldValue.increment(isWinner ? 1 : 0),
-      lastPlayed: admin.firestore.FieldValue.serverTimestamp()
-    }, { merge: true });
-
-    res.json({ 
-      success: true, 
-      isWinner, 
-      trophiesChange, 
-      xpGain,
-      message: isWinner ? "Panalo validated!" : "Talo recorded." 
-    });
-
-  } catch (error) {
-    console.error("Critical Validation Error:", error);
-    res.status(500).json({ error: error.message });
   }
 });
 
@@ -189,7 +176,8 @@ app.post('/api/validate-win', async (req, res) => {
 if (require.main === module) {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => {
-    console.log(`✅ Server is RUNNING! Port: ${PORT}`);
+    console.log(`✅ Secured Server is RUNNING! Port: ${PORT}`);
   });
 }
+
 module.exports = app;
