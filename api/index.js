@@ -2,16 +2,14 @@ const express = require('express');
 const admin = require('firebase-admin');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const crypto = require('crypto'); // Import para sa security validation
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// --- 1. FIREBASE SETUP ---
-if (!process.env.FIREBASE_KEY) {
-  console.log("Warning: FIREBASE_KEY not found.");
-} else {
+// --- 1. FIREBASE SETUP (Optimized for Vercel) ---
+if (process.env.FIREBASE_KEY) {
   try {
     const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
     if (!admin.apps.length) {
@@ -27,7 +25,6 @@ if (!process.env.FIREBASE_KEY) {
 const db = admin.firestore();
 
 // --- 2. SECURITY HELPER: TELEGRAM VALIDATION ---
-// Tinitiyak nito na ang request ay galing talaga sa Telegram app mo.
 function verifyTelegramData(initData) {
   if (!initData || !process.env.TELEGRAM_BOT_TOKEN) return false;
 
@@ -50,134 +47,86 @@ function verifyTelegramData(initData) {
   return calculatedHash === hash;
 }
 
-// --- 3. API: HEALTH CHECK ---
+// --- 3. ROUTES (Inalis na ang /api prefix dahil nasa api folder na ito) ---
+
+// Root check: babasahin ito as yourdomain.com/api
 app.get('/', (req, res) => {
   res.send('Pinoy Pool Server is LIVE! 🎱 - Secured Version');
 });
 
-// --- 4. API: AD REWARD (SECURED) ---
-app.post('/api/ad-reward', async (req, res) => {
+// Ad Reward: yourdomain.com/api/ad-reward
+app.post('/ad-reward', async (req, res) => {
   const { uid, initData } = req.body;
+  if (!verifyTelegramData(initData)) return res.status(401).json({ error: "Unauthorized" });
 
-  // Security Check: Galing ba sa Telegram?
-  if (!verifyTelegramData(initData)) {
-    return res.status(401).json({ error: "Unauthorized access" });
-  }
-
-  const FIXED_AD_REWARD = 50; // Dito mo i-set ang reward, hindi sa client!
-
+  const FIXED_AD_REWARD = 50;
   try {
     const playerRef = db.collection('players').doc(uid);
-    await playerRef.update({
-      balance: admin.firestore.FieldValue.increment(FIXED_AD_REWARD)
-    });
+    await playerRef.update({ balance: admin.firestore.FieldValue.increment(FIXED_AD_REWARD) });
     const updatedDoc = await playerRef.get();
     res.json({ success: true, newBalance: updatedDoc.data().balance });
-  } catch (error) {
-    res.status(500).json({ error: "Reward failed" });
-  }
+  } catch (error) { res.status(500).json({ error: "Failed" }); }
 });
 
-// --- 5. API: START MATCH (NEW SECURITY LAYER) ---
-// Tatawagin ito sa simula ng laro para magkaroon ng "Match Record"
-app.post('/api/start-match', async (req, res) => {
+// Start Match: yourdomain.com/api/start-match
+app.post('/start-match', async (req, res) => {
   const { uid, betAmount, initData } = req.body;
-
   if (!verifyTelegramData(initData)) return res.status(401).json({ error: "Unauthorized" });
 
   const matchId = `match_${Date.now()}_${uid}`;
-
   try {
     const playerRef = db.collection('players').doc(uid);
-    
     await db.runTransaction(async (t) => {
       const doc = await t.get(playerRef);
       if (!doc.exists) throw "User not found";
-      
       const currentBalance = doc.data().balance || 0;
       if (currentBalance < betAmount) throw "Insufficient funds";
 
-      // Bawasan ang pera at i-record ang match
       t.update(playerRef, { balance: currentBalance - betAmount });
       t.set(db.collection('matches').doc(matchId), {
-        uid,
-        bet: betAmount,
-        status: 'active',
-        startTime: admin.firestore.FieldValue.serverTimestamp()
+        uid, bet: betAmount, status: 'active', startTime: admin.firestore.FieldValue.serverTimestamp()
       });
     });
-
     res.json({ success: true, matchId });
-  } catch (error) {
-    res.status(400).json({ error: error.toString() });
-  }
+  } catch (error) { res.status(400).json({ error: error.toString() }); }
 });
 
-// --- 6. API: VALIDATE WIN & PAYOUT (SECURED) ---
-app.post('/api/validate-win', async (req, res) => {
+// Validate Win: yourdomain.com/api/validate-win
+app.post('/validate-win', async (req, res) => {
   const { uid, matchId, initData } = req.body;
-
   if (!verifyTelegramData(initData)) return res.status(401).json({ error: "Unauthorized" });
 
   try {
     const matchRef = db.collection('matches').doc(matchId);
     const playerRef = db.collection('players').doc(uid);
-
     const result = await db.runTransaction(async (t) => {
       const matchDoc = await t.get(matchRef);
-      
-      if (!matchDoc.exists || matchDoc.data().status !== 'active') {
-        throw "Invalid or expired match";
-      }
+      if (!matchDoc.exists || matchDoc.data().status !== 'active') throw "Invalid match";
 
-      const matchData = matchDoc.data();
-      const WINNINGS = matchData.bet * 1.8; // 10% House Cut per player
-      const TROPHIES = 25;
-      const XP = 50;
-
-      // I-update ang player
+      const WINNINGS = matchDoc.data().bet * 1.8;
       t.update(playerRef, {
         balance: admin.firestore.FieldValue.increment(WINNINGS),
-        trophies: admin.firestore.FieldValue.increment(TROPHIES),
-        xp: admin.firestore.FieldValue.increment(XP),
+        trophies: admin.firestore.FieldValue.increment(25),
+        xp: admin.firestore.FieldValue.increment(50),
         wins: admin.firestore.FieldValue.increment(1)
       });
-
-      // Tapusin na ang match record para hindi na ma-claim ulit
       t.update(matchRef, { status: 'completed', payout: WINNINGS });
-
-      return { winnings: WINNINGS, trophies: TROPHIES, xp: XP };
+      return { winnings: WINNINGS, trophies: 25, xp: 50 };
     });
-
     res.json({ success: true, data: result });
-  } catch (error) {
-    res.status(400).json({ error: error.toString() });
-  }
+  } catch (error) { res.status(400).json({ error: error.toString() }); }
 });
 
-// --- 7. API: REFUND (SECURED) ---
-app.post('/api/refund', async (req, res) => {
+// Refund: yourdomain.com/api/refund
+app.post('/refund', async (req, res) => {
   const { uid, amount, initData } = req.body;
-  
   if (!verifyTelegramData(initData)) return res.status(401).json({ error: "Unauthorized" });
-
   try {
     const playerRef = db.collection('players').doc(uid);
-    await playerRef.update({
-      balance: admin.firestore.FieldValue.increment(amount)
-    });
+    await playerRef.update({ balance: admin.firestore.FieldValue.increment(amount) });
     res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: "Refund failed" });
-  }
+  } catch (error) { res.status(500).json({ error: "Refund failed" }); }
 });
 
-// --- HYBRID START ---
-if (require.main === module) {
-  const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => {
-    console.log(`✅ Secured Server is RUNNING! Port: ${PORT}`);
-  });
-}
-
+// --- EXPORT FOR VERCEL ---
 module.exports = app;
